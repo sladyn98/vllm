@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side logic for the NIXL connector."""
 
+import contextlib
 import logging
 import os
 import queue
@@ -300,8 +301,14 @@ class NixlConnectorWorker:
         )
         self._ready_requests = queue.Queue[tuple[ReqId, ReqMeta]]()
         self._handshake_futures: dict[EngineId, Future[dict[int, str]]] = {}
-        # Protects _handshake_futures and _remote_agents.
+        # Protects _handshake_futures, _remote_agents, and
+        # _engine_id_by_endpoint.
         self._handshake_lock = threading.RLock()
+        # Track which engine_id most recently handshook from a given
+        # (host, port). Used to detect worker restarts that reuse the same
+        # endpoint under a new engine_id so we can invalidate stale state
+        # before the new registration lands.
+        self._engine_id_by_endpoint: dict[tuple[str, int], EngineId] = {}
 
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
@@ -382,6 +389,7 @@ class NixlConnectorWorker:
         assert self.transfer_topo is not None
         p_remote_ranks = self.transfer_topo.handshake_target_ranks(remote_tp_size)
         remote_rank_to_agent_name = {}
+        endpoint = (host, port)
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
@@ -460,9 +468,14 @@ class NixlConnectorWorker:
                         f"received {metadata.engine_id}."
                     )
 
-                # Register Remote agent.
-                remote_agent_name = self.add_remote_agent(
-                    metadata, remote_rank, remote_tp_size
+                # Register remote agent only if this endpoint still belongs to
+                # the engine_id that started the handshake.
+                remote_agent_name = self._add_remote_agent_if_current(
+                    endpoint,
+                    expected_engine_id,
+                    metadata,
+                    remote_tp_rank=remote_rank,
+                    remote_tp_size=remote_tp_size,
                 )
                 setup_agent_time = time.perf_counter()
                 logger.debug(
@@ -578,36 +591,133 @@ class NixlConnectorWorker:
             stacklevel=2,
         )
 
+    def _invalidate_remote_engine(self, stale_engine_id: EngineId) -> None:
+        """Drop all per-engine handshake state for ``stale_engine_id``."""
+        with self._handshake_lock:
+            fut = self._handshake_futures.pop(stale_engine_id, None)
+            if fut is not None:
+                fut.cancel()
+            stale_endpoints = [
+                endpoint
+                for endpoint, engine_id in self._engine_id_by_endpoint.items()
+                if engine_id == stale_engine_id
+            ]
+            for endpoint in stale_endpoints:
+                self._engine_id_by_endpoint.pop(endpoint, None)
+            for agent_name in self._remote_agents.pop(stale_engine_id, {}).values():
+                with contextlib.suppress(Exception):
+                    self.nixl_wrapper.remove_remote_agent(agent_name)
+            for handle in self.dst_xfer_side_handles.pop(
+                stale_engine_id, {}
+            ).values():
+                with contextlib.suppress(Exception):
+                    self.nixl_wrapper.release_dlist_handle(handle)
+            self.kv_caches_base_addr.pop(stale_engine_id, None)
+            self.dst_num_blocks.pop(stale_engine_id, None)
+            self._physical_blocks_per_logical.pop(stale_engine_id, None)
+            if self.transfer_topo is not None:
+                self.transfer_topo.deregister_remote_engine(stale_engine_id)
+            logger.info(
+                "NIXL: invalidated stale handshake state for engine_id %s",
+                stale_engine_id,
+            )
+
+    def _add_remote_agent_if_current(
+        self,
+        endpoint: tuple[str, int],
+        expected_engine_id: EngineId,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> str:
+        """Register remote metadata only while the endpoint mapping is current.
+
+        ``add_remote_agent`` mutates multiple per-engine structures, so guard
+        the whole registration with ``_handshake_lock``. If the endpoint has
+        already been reassigned to a newer engine_id, clean up any partial
+        state and fail the stale handshake before it can reinsert metadata.
+        """
+        with self._handshake_lock:
+            current_engine_id = self._engine_id_by_endpoint.get(endpoint)
+            if current_engine_id != expected_engine_id:
+                self._invalidate_remote_engine(expected_engine_id)
+                raise RuntimeError(
+                    "Remote endpoint "
+                    f"{endpoint[0]}:{endpoint[1]} "
+                    "was reassigned before handshake registration "
+                    f"for engine_id {expected_engine_id} completed; "
+                    f"current engine_id is {current_engine_id!r}."
+                )
+            return self.add_remote_agent(
+                nixl_agent_meta,
+                remote_tp_rank=remote_tp_rank,
+                remote_tp_size=remote_tp_size,
+            )
+
     def _background_nixl_handshake(
         self, req_id: str, remote_engine_id: EngineId, meta: ReqMeta
     ):
         # Do NIXL handshake in background and add to _ready_requests when done.
-        fut = self._handshake_futures.get(remote_engine_id)
-        if fut is None:
-            assert meta.remote is not None
-            fut = self._handshake_initiation_executor.submit(
-                self._nixl_handshake,
-                meta.remote.host,
-                meta.remote.port,
-                meta.tp_size,
-                remote_engine_id,
-            )
-            self._handshake_futures[remote_engine_id] = fut
+        assert meta.remote is not None
+        endpoint = (meta.remote.host, meta.remote.port)
+        with self._handshake_lock:
+            fut = self._handshake_futures.get(remote_engine_id)
+            if fut is None:
+                # If a different engine_id previously handshook from this same
+                # (host, port), the remote worker has restarted. Drop the stale
+                # state before kicking off the new handshake so that per-engine
+                # assertions (layer count, num_blocks) see a clean slate.
+                prev_engine_id = self._engine_id_by_endpoint.get(endpoint)
+                if prev_engine_id is not None and prev_engine_id != remote_engine_id:
+                    self._invalidate_remote_engine(prev_engine_id)
+                self._engine_id_by_endpoint[endpoint] = remote_engine_id
+                fut = self._handshake_initiation_executor.submit(
+                    self._nixl_handshake,
+                    meta.remote.host,
+                    meta.remote.port,
+                    meta.tp_size,
+                    remote_engine_id,
+                )
+                self._handshake_futures[remote_engine_id] = fut
 
-            def done_callback(f: Future[dict[int, str]], eid=remote_engine_id):
-                with self._handshake_lock:
-                    del self._handshake_futures[eid]
-                    try:
-                        self._remote_agents[eid] = f.result()
-                    except Exception as e:
-                        self._log_failure(
-                            failure_type="handshake_setup_failed",
-                            req_id=None,
-                            error=e,
-                            remote_engine_id=eid,
-                        )
+                def done_callback(
+                    f: Future[dict[int, str]],
+                    eid=remote_engine_id,
+                    handshake_endpoint=endpoint,
+                ):
+                    with self._handshake_lock:
+                        # pop (not del) because _invalidate_remote_engine may
+                        # already have removed this entry if the endpoint
+                        # re-registered under a new engine_id before the
+                        # in-flight handshake finished.
+                        self._handshake_futures.pop(eid, None)
+                        try:
+                            remote_agents = f.result()
+                            if (
+                                self._engine_id_by_endpoint.get(
+                                    handshake_endpoint
+                                )
+                                != eid
+                            ):
+                                self._invalidate_remote_engine(eid)
+                                logger.info(
+                                    "NIXL: ignored completed handshake for stale "
+                                    "engine_id %s at endpoint %s:%s",
+                                    eid,
+                                    handshake_endpoint[0],
+                                    handshake_endpoint[1],
+                                )
+                                return
+                            self._remote_agents[eid] = remote_agents
+                        except Exception as e:
+                            self._log_failure(
+                                failure_type="handshake_setup_failed",
+                                req_id=None,
+                                error=e,
+                                remote_engine_id=eid,
+                            )
 
-            fut.add_done_callback(done_callback)
+                fut.add_done_callback(done_callback)
 
         # check handshake success before proceeding with request
         def request_ready(f: Future[Any], entry=(req_id, meta)):

@@ -535,6 +535,60 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         return remote_agents
 
 
+class DelayedSuccessNixlConnectorWorker(FakeNixlConnectorWorker):
+    """Handshake test double that succeeds for the requested engine_id."""
+
+    def _nixl_handshake(
+        self, host: str, port: int, remote_tp_size: int, expected_engine_id: str
+    ) -> dict[int, str]:
+        # Mimic slow _nixl_handshake, but keep the response keyed to the
+        # engine_id that launched the handshake so older futures can still
+        # succeed after a later re-registration changes REMOTE_ENGINE_ID.
+        time.sleep(self._hand_shake_latency)
+
+        slot_size_bytes = 4096
+        self.slot_size_per_layer = [slot_size_bytes]
+        self.block_len_per_layer = [slot_size_bytes * self.block_size]
+        self.num_blocks = 1
+        self.dst_num_blocks[self.engine_id] = self.num_blocks
+
+        remote_block_lens = list(self.block_len_per_layer)
+        tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
+        if remote_tp_size > self.world_size:
+            remote_block_lens = [
+                block_len // (-tp_ratio) for block_len in remote_block_lens
+            ]
+        elif remote_tp_size < self.world_size:
+            remote_block_lens = [
+                block_len * tp_ratio for block_len in remote_block_lens
+            ]
+
+        num_handshakes = 1 if tp_ratio > 0 else -tp_ratio
+        remote_agents: dict[int, str] = {}
+        endpoint = (host, port)
+        for remote_tp_rank in range(num_handshakes):
+            remote_agent_name = self._add_remote_agent_if_current(
+                endpoint,
+                expected_engine_id,
+                NixlAgentMetadata(
+                    engine_id=expected_engine_id,
+                    agent_metadata=FakeNixlWrapper.AGENT_METADATA,
+                    kv_caches_base_addr=[0],
+                    device_id=remote_tp_rank,
+                    num_blocks=1,
+                    block_lens=remote_block_lens,
+                    kv_cache_layout="HND",
+                    block_size=self.block_size,
+                    ssm_sizes=(0, 0),
+                    attn_backend_name=self.backend_name,
+                ),
+                remote_tp_rank=remote_tp_rank,
+                remote_tp_size=remote_tp_size,
+            )
+            remote_agents[remote_tp_rank] = remote_agent_name
+        return remote_agents
+
+
 class TestNixlHandshake:
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.NixlWrapper",
@@ -762,6 +816,146 @@ class TestNixlHandshake:
             expected_engine_id=worker.REMOTE_ENGINE_ID,
         )
         check_handshake(6)
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_stale_engine_invalidated_on_endpoint_reregistration(
+        self, default_vllm_config, dist_init
+    ):
+        """Issue #38840: when a remote worker restarts and re-registers at
+        the same ``(host, port)`` under a new ``engine_id``, prior per-engine
+        handshake state must be invalidated. Otherwise the stale entries in
+        ``dst_num_blocks`` / ``kv_caches_base_addr`` / ``transfer_topo`` can
+        trip layer-count and num_blocks assertions during the new handshake.
+        """
+        vllm_config = create_vllm_config()
+        connector = NixlConnector(
+            vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
+        )
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+
+        # Minimal local registration params used by add_remote_agent.
+        worker.slot_size_per_layer = [4096]
+        worker.block_len_per_layer = [4096 * worker.block_size]
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+        worker.src_blocks_data = [(0, worker.block_len_per_layer[0], worker.tp_rank)]
+
+        # Seed per-engine state as if engine_A had completed a handshake
+        # at endpoint ("host", 1234).
+        worker._engine_id_by_endpoint[("host", 1234)] = "engine_A"
+        worker._remote_agents["engine_A"] = {0: "stale_agent"}
+        worker.dst_num_blocks["engine_A"] = 1
+        worker.kv_caches_base_addr["engine_A"][0] = [0]
+        worker.dst_xfer_side_handles["engine_A"][0] = 42
+        worker.transfer_topo.register_remote_engine(
+            remote_engine_id="engine_A",
+            remote_tp_size=1,
+            remote_block_size=worker.block_size,
+            remote_block_len=worker.block_len_per_layer[0],
+            remote_physical_blocks_per_logical=1,
+            local_block_len=worker.block_len_per_layer[0],
+        )
+
+        # Unit: _invalidate_remote_engine drops every per-engine entry.
+        worker._invalidate_remote_engine("engine_A")
+        assert ("host", 1234) not in worker._engine_id_by_endpoint
+        assert "engine_A" not in worker._remote_agents
+        assert "engine_A" not in worker.dst_num_blocks
+        assert "engine_A" not in worker.kv_caches_base_addr
+        assert "engine_A" not in worker.dst_xfer_side_handles
+        assert "engine_A" not in worker.transfer_topo._engines
+
+        # Integration: _background_nixl_handshake at the same endpoint
+        # under a new engine_id must synchronously invalidate the prior
+        # entry before submitting the new handshake.
+        worker._engine_id_by_endpoint[("host", 1234)] = "engine_A"
+        worker._remote_agents["engine_A"] = {0: "stale_agent"}
+        worker.dst_num_blocks["engine_A"] = 1
+        worker.kv_caches_base_addr["engine_A"][0] = [0]
+        worker.transfer_topo.register_remote_engine(
+            remote_engine_id="engine_A",
+            remote_tp_size=1,
+            remote_block_size=worker.block_size,
+            remote_block_len=worker.block_len_per_layer[0],
+            remote_physical_blocks_per_logical=1,
+            local_block_len=worker.block_len_per_layer[0],
+        )
+
+        meta = MagicMock()
+        meta.remote.host = "host"
+        meta.remote.port = 1234
+        meta.tp_size = 1
+        worker.REMOTE_ENGINE_ID = "engine_B"
+        worker._background_nixl_handshake("req_1", "engine_B", meta)
+
+        # Wait for the background handshake future to finish.
+        worker._handshake_initiation_executor.shutdown(wait=True)
+
+        assert worker._engine_id_by_endpoint[("host", 1234)] == "engine_B"
+        assert "engine_A" not in worker._remote_agents
+        assert "engine_A" not in worker.dst_num_blocks
+        assert "engine_A" not in worker.kv_caches_base_addr
+        assert "engine_A" not in worker.transfer_topo._engines
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_inflight_stale_handshake_does_not_reinsert_state(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config()
+        connector = NixlConnector(
+            vllm_config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
+        )
+        connector.connector_worker = DelayedSuccessNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0.05
+        )
+        worker = connector.connector_worker
+
+        worker.slot_size_per_layer = [4096]
+        worker.block_len_per_layer = [4096 * worker.block_size]
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+        worker.src_blocks_data = [(0, worker.block_len_per_layer[0], worker.tp_rank)]
+
+        meta_a = MagicMock()
+        meta_a.remote.host = "host"
+        meta_a.remote.port = 1234
+        meta_a.remote.engine_id = "engine_A"
+        meta_a.remote.request_id = "remote_req_a"
+        meta_a.tp_size = 1
+        meta_a.local_block_ids = ([],)
+
+        meta_b = MagicMock()
+        meta_b.remote.host = "host"
+        meta_b.remote.port = 1234
+        meta_b.remote.engine_id = "engine_B"
+        meta_b.remote.request_id = "remote_req_b"
+        meta_b.tp_size = 1
+        meta_b.local_block_ids = ([],)
+
+        worker._background_nixl_handshake("req_a", "engine_A", meta_a)
+        time.sleep(0.01)
+        worker._background_nixl_handshake("req_b", "engine_B", meta_b)
+
+        worker._handshake_initiation_executor.shutdown(wait=True)
+
+        assert worker._engine_id_by_endpoint[("host", 1234)] == "engine_B"
+        assert "engine_A" not in worker._remote_agents
+        assert "engine_A" not in worker.dst_num_blocks
+        assert "engine_A" not in worker.kv_caches_base_addr
+        assert "engine_A" not in worker.dst_xfer_side_handles
+        assert "engine_A" not in worker.transfer_topo._engines
+        assert worker._remote_agents["engine_B"] == {
+            0: FakeNixlWrapper.REMOTE_AGENT_NAME
+        }
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker.NixlWrapper",

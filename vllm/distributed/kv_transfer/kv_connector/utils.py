@@ -541,6 +541,17 @@ class TransferTopology:
     def get_engine_info(self, remote_engine_id: EngineId) -> EngineTransferInfo:
         return self._engines[remote_engine_id]
 
+    def deregister_remote_engine(self, remote_engine_id: EngineId) -> None:
+        """Remove all per-engine state for a remote engine.
+
+        Used when a remote worker at a known endpoint re-registers under a
+        new engine_id (e.g. pod restart) so that stale transfer plans don't
+        leak into the new registration.
+        """
+        self._engines.pop(remote_engine_id, None)
+        self._fa_source_sets.pop(remote_engine_id, None)
+        self._fa_source_indices.pop(remote_engine_id, None)
+
     # ============================================================
     # Layout properties
     # ============================================================
