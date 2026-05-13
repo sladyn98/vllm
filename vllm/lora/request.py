@@ -20,6 +20,9 @@ class LoRARequest(
         with the same lora_int_id already exists in the cache. This replaces
         the existing adapter in-place. If False (default), only loads if the
         adapter is not already loaded.
+    lora_cache_key: Optional key that identifies the loaded adapter contents
+        for prefix caching. This lets the serving layer invalidate LoRA prefix
+        cache entries when reloading a same-name adapter in place.
     """
 
     lora_name: str
@@ -28,6 +31,7 @@ class LoRARequest(
     base_model_name: str | None = msgspec.field(default=None)
     tensorizer_config_dict: dict | None = None
     load_inplace: bool = False
+    lora_cache_key: str | None = None
 
     def __post_init__(self):
         if self.lora_int_id < 1:
