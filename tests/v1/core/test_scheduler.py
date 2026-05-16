@@ -1339,6 +1339,17 @@ def test_kv_connector_basic(is_async: bool):
     )
 
 
+def test_kv_connector_rejects_overreported_matched_tokens():
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=999999, is_async=False)
+    )
+    request = create_requests(num_requests=1, num_tokens=3)[0]
+    scheduler.add_request(request)
+
+    with pytest.raises(AssertionError):
+        scheduler.schedule()
+
+
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.parametrize("local_cache_hits", [False, True])
 def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
